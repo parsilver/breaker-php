@@ -2,6 +2,8 @@
 
 namespace Farzai\Breaker;
 
+use Farzai\Breaker\Events\EventDispatcher;
+use Farzai\Breaker\Events\Events;
 use Farzai\Breaker\States\ClosedState;
 use Farzai\Breaker\States\HalfOpenState;
 use Farzai\Breaker\States\OpenState;
@@ -30,6 +32,11 @@ class CircuitBreaker
     protected StorageInterface $storage;
 
     /**
+     * Event dispatcher for circuit breaker events.
+     */
+    protected EventDispatcher $eventDispatcher;
+
+    /**
      * Create a new CircuitBreaker instance.
      */
     public function __construct(
@@ -44,6 +51,7 @@ class CircuitBreaker
         $this->timeout = $options['timeout'] ?? 30;
 
         $this->storage = $storage ?? new InMemoryStorage;
+        $this->eventDispatcher = new EventDispatcher;
 
         $this->initializeState();
     }
@@ -53,7 +61,41 @@ class CircuitBreaker
      */
     public function call(callable $callable): mixed
     {
-        return $this->state->call($this, $callable);
+        try {
+            $result = $this->state->call($this, $callable);
+
+            // Dispatch success event
+            $this->eventDispatcher->dispatch(Events::SUCCESS, [$result, $this]);
+
+            return $result;
+        } catch (\Throwable $exception) {
+            // Dispatch failure event
+            $this->eventDispatcher->dispatch(Events::FAILURE, [$exception, $this]);
+
+            throw $exception;
+        }
+    }
+
+    /**
+     * Execute a protected callable with a fallback.
+     *
+     * @param  callable  $callable  The primary function to execute
+     * @param  callable  $fallback  The fallback function to execute if the primary function fails
+     * @return mixed The result of either the primary function or the fallback
+     */
+    public function callWithFallback(callable $callable, callable $fallback): mixed
+    {
+        try {
+            return $this->call($callable);
+        } catch (\Throwable $exception) {
+            // Pass both the exception and the circuit breaker instance to the fallback
+            $fallbackResult = $fallback($exception, $this);
+
+            // Dispatch fallback success event
+            $this->eventDispatcher->dispatch(Events::FALLBACK_SUCCESS, [$fallbackResult, $exception, $this]);
+
+            return $fallbackResult;
+        }
     }
 
     /**
@@ -178,12 +220,132 @@ class CircuitBreaker
     }
 
     /**
+     * Get the service key.
+     */
+    public function getServiceKey(): string
+    {
+        return $this->serviceKey;
+    }
+
+    /**
+     * Add a listener for state changes.
+     *
+     * @param  callable  $listener  Function that receives ($newState, $oldState, $circuitBreaker)
+     * @return int The listener ID
+     */
+    public function onStateChange(callable $listener): int
+    {
+        return $this->eventDispatcher->addListener(Events::STATE_CHANGE, $listener);
+    }
+
+    /**
+     * Add a listener for when the circuit opens.
+     *
+     * @param  callable  $listener  Function that receives ($circuitBreaker)
+     * @return int The listener ID
+     */
+    public function onOpen(callable $listener): int
+    {
+        return $this->eventDispatcher->addListener(Events::OPEN, $listener);
+    }
+
+    /**
+     * Add a listener for when the circuit closes.
+     *
+     * @param  callable  $listener  Function that receives ($circuitBreaker)
+     * @return int The listener ID
+     */
+    public function onClose(callable $listener): int
+    {
+        return $this->eventDispatcher->addListener(Events::CLOSE, $listener);
+    }
+
+    /**
+     * Add a listener for when the circuit transitions to half-open.
+     *
+     * @param  callable  $listener  Function that receives ($circuitBreaker)
+     * @return int The listener ID
+     */
+    public function onHalfOpen(callable $listener): int
+    {
+        return $this->eventDispatcher->addListener(Events::HALF_OPEN, $listener);
+    }
+
+    /**
+     * Add a listener for successful calls.
+     *
+     * @param  callable  $listener  Function that receives ($result, $circuitBreaker)
+     * @return int The listener ID
+     */
+    public function onSuccess(callable $listener): int
+    {
+        return $this->eventDispatcher->addListener(Events::SUCCESS, $listener);
+    }
+
+    /**
+     * Add a listener for failed calls.
+     *
+     * @param  callable  $listener  Function that receives ($exception, $circuitBreaker)
+     * @return int The listener ID
+     */
+    public function onFailure(callable $listener): int
+    {
+        return $this->eventDispatcher->addListener(Events::FAILURE, $listener);
+    }
+
+    /**
+     * Add a listener for successful fallbacks.
+     *
+     * @param  callable  $listener  Function that receives ($fallbackResult, $exception, $circuitBreaker)
+     * @return int The listener ID
+     */
+    public function onFallbackSuccess(callable $listener): int
+    {
+        return $this->eventDispatcher->addListener(Events::FALLBACK_SUCCESS, $listener);
+    }
+
+    /**
+     * Remove a listener by its ID.
+     *
+     * @param  int  $listenerId  The listener ID to remove
+     * @return bool True if the listener was removed, false if it didn't exist
+     */
+    public function removeListener(int $listenerId): bool
+    {
+        return $this->eventDispatcher->removeListener($listenerId);
+    }
+
+    /**
      * Set the current state.
      */
     protected function setState(StateInterface $state): void
     {
+        $oldState = isset($this->state) ? $this->state->getName() : 'none';
+        $newState = $state->getName();
+
         $this->state = $state;
         $this->saveState();
+
+        // Don't dispatch events if this is the initial state
+        if ($oldState === 'none') {
+            return;
+        }
+
+        // Dispatch general state change event
+        $this->eventDispatcher->dispatch(Events::STATE_CHANGE, [$newState, $oldState, $this]);
+
+        // Dispatch specific state transition event
+        switch ($newState) {
+            case 'open':
+                $this->eventDispatcher->dispatch(Events::OPEN, [$this]);
+                break;
+            case 'closed':
+                $this->eventDispatcher->dispatch(Events::CLOSE, [$this]);
+                break;
+            case 'half-open':
+                $this->eventDispatcher->dispatch(Events::HALF_OPEN, [$this]);
+                break;
+        }
     }
 
     /**

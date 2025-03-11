@@ -1,6 +1,6 @@
-# Contributing to Farzai Breaker
+# Contributing to Circuit Breaker - PHP
 
-Thank you for considering contributing to Farzai Breaker! This document provides some basic guidelines to help you get started.
+Thank you for considering contributing to Circuit Breaker - PHP! This document provides some basic guidelines to help you get started.
 
 ## Development Setup
 
@@ -21,14 +21,6 @@ composer test
 ```
 
 Make sure all tests pass before submitting your pull request.
-
-## Coding Style
-
-This project follows PSR-12 coding standards. We use PHP-CS-Fixer to enforce our coding style:
-
-```bash
-composer cs-fix
-```
 
 Also, we use PHPStan for static analysis:
 
