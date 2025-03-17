@@ -20,7 +20,7 @@
         "pestphp/pest": "^3.5",
         "laravel/pint": "^1.0",
         "spatie/ray": "^1.28",
-        "phpstan/phpstan": "^1.10"
+        "phpstan/phpstan": "^1.10 || ^2.0"
     },
     "scripts": {
         "test": "vendor/bin/pest",
