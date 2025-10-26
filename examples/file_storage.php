@@ -4,7 +4,7 @@ require_once __DIR__.'/../vendor/autoload.php';
 
 use Farzai\Breaker\CircuitBreaker;
 use Farzai\Breaker\Exceptions\CircuitOpenException;
-use Farzai\Breaker\Storage\FileStorage;
+use Farzai\Breaker\Storage\StorageFactory;
 
 // Create a storage directory
 $storageDir = __DIR__.'/storage';
@@ -12,15 +12,17 @@ if (! is_dir($storageDir)) {
     mkdir($storageDir, 0755, true);
 }
 
-// Create a file storage instance
-$storage = new FileStorage($storageDir);
+// Create a file storage repository using the factory
+$repository = StorageFactory::createRepository(
+    StorageFactory::file($storageDir)
+);
 
 // Create a circuit breaker with file storage
 $breaker = new CircuitBreaker('persistent-service', [
     'failure_threshold' => 3,
     'timeout' => 5,
     'success_threshold' => 2,
-], $storage);
+], $repository);
 
 // Simulate a service call
 function callService($shouldFail = false)

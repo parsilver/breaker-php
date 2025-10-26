@@ -15,44 +15,65 @@ $breaker = new CircuitBreaker('api-service', [
 // Add event listeners
 echo "Adding event listeners...\n";
 
-// Listen to state transitions
-$breaker->onStateChange(function ($newState, $oldState, $breaker) {
-    echo "Circuit state changed from {$oldState} to {$newState} for service {$breaker->getServiceKey()}\n";
+// Listen to state transitions with new event objects
+$breaker->onStateChange(function ($event) {
+    echo sprintf(
+        "Circuit state changed from %s to %s for service %s\n",
+        $event->getPreviousState(),
+        $event->getNewState(),
+        $event->getServiceKey()
+    );
 });
 
-// Listen to specific state transitions
-$breaker->onOpen(function ($breaker) {
-    echo "Circuit opened! Service {$breaker->getServiceKey()} is experiencing problems.\n";
-    echo "Will try again after {$breaker->getTimeout()} seconds.\n";
+// Listen to specific state transitions with typed events
+$breaker->onOpen(function ($event) {
+    echo "Circuit opened! Service {$event->getServiceKey()} is experiencing problems.\n";
+    echo "Failure count: {$event->getFailureCount()}/{$event->getFailureThreshold()}\n";
+    echo "Will try again after {$event->getTimeout()} seconds.\n";
+    echo 'Half-open at: '.date('H:i:s', $event->getHalfOpenTimestamp())."\n";
 
     // In a real application, you might:
     // - Send a notification to an admin
     // - Log the event to a monitoring system
     // - Update a dashboard status
+    // - Trigger alerting based on event properties
 });
 
-$breaker->onHalfOpen(function ($breaker) {
-    echo "Circuit half-open! Testing if service {$breaker->getServiceKey()} is back online...\n";
+$breaker->onHalfOpen(function ($event) {
+    echo "Circuit half-open! Testing if service {$event->getServiceKey()} is back online...\n";
+    echo "Need {$event->getSuccessThreshold()} successful calls to close.\n";
 });
 
-$breaker->onClose(function ($breaker) {
-    echo "Circuit closed! Service {$breaker->getServiceKey()} is back to normal operation.\n";
+$breaker->onClose(function ($event) {
+    $message = $event->isRecovery()
+        ? 'recovered from failure'
+        : 'reset';
+    echo "Circuit closed! Service {$event->getServiceKey()} has {$message}.\n";
 });
 
-// Listen to call success and failures
-$breaker->onSuccess(function ($result, $breaker) {
-    echo 'Successful call! Result: '.json_encode($result)."\n";
+// Listen to call success and failures with detailed metrics
+$breaker->onSuccess(function ($event) {
+    echo 'Successful call! Result: '.json_encode($event->getResult())."\n";
+    echo sprintf("Execution time: %.2fms\n", $event->getExecutionTime());
+    echo "Current state: {$event->getCurrentState()}\n";
 });
 
-$breaker->onFailure(function ($exception, $breaker) {
-    echo "Call failed! Error: {$exception->getMessage()}\n";
-    echo "Failure count: {$breaker->getFailureCount()}/{$breaker->getFailureThreshold()}\n";
+$breaker->onFailure(function ($event) {
+    echo "Call failed! Error: {$event->getExceptionMessage()}\n";
+    echo "Exception type: {$event->getExceptionClass()}\n";
+    echo sprintf("Execution time before failure: %.2fms\n", $event->getExecutionTime());
+    echo "Failure count: {$event->getFailureCount()}/{$event->getFailureThreshold()}\n";
+
+    if ($event->willTriggerOpen()) {
+        echo "⚠️  This failure will trigger the circuit to open!\n";
+    }
 });
 
-// Listen to fallback usage
-$breaker->onFallbackSuccess(function ($result, $exception, $breaker) {
-    echo 'Fallback used! Result: '.json_encode($result)."\n";
-    echo "Original error: {$exception->getMessage()}\n";
+// Listen to fallback usage with comprehensive info
+$breaker->onFallbackSuccess(function ($event) {
+    echo 'Fallback used! Result: '.json_encode($event->getResult())."\n";
+    echo "Original error: {$event->getOriginalExceptionMessage()}\n";
+    echo sprintf("Fallback execution time: %.2fms\n", $event->getExecutionTime());
 });
 
 // Simulate API calls

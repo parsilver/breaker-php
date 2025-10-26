@@ -14,7 +14,13 @@
         }
     },
     "require": {
-        "php": "^8.2"
+        "php": "^8.2",
+        "psr/log": "^3.0",
+        "psr/event-dispatcher": "^1.0",
+        "psr/simple-cache": "^3.0"
+    },
+    "suggest": {
+        "predis/predis": "Required for Redis storage adapter (^2.0)"
     },
     "require-dev": {
         "pestphp/pest": "^3.5",
@@ -26,7 +32,7 @@
         "test": "vendor/bin/pest",
         "test-coverage": "vendor/bin/pest --coverage",
         "format": "vendor/bin/pint",
-        "phpstan": "vendor/bin/phpstan analyse src tests"
+        "phpstan": "vendor/bin/phpstan analyse src"
     },
     "config": {
         "sort-packages": true,
