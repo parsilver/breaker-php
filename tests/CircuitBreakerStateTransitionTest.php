@@ -1,8 +1,9 @@
 <?php
 
 use Farzai\Breaker\CircuitBreaker;
-use Farzai\Breaker\Events\Events;
-use Farzai\Breaker\Storage\InMemoryStorage;
+use Farzai\Breaker\Storage\Adapters\InMemoryStorageAdapter;
+use Farzai\Breaker\Storage\DefaultCircuitStateRepository;
+use Farzai\Breaker\Storage\JsonStorageSerializer;
 
 // Test CircuitBreaker state transitions and event dispatching
 test('circuit breaker dispatches state change events', function () {
@@ -16,19 +17,19 @@ test('circuit breaker dispatches state change events', function () {
     $halfOpenEvents = [];
 
     // Add listeners for state change events
-    $breaker->onStateChange(function ($newState, $oldState, $circuitBreaker) use (&$stateChangeEvents) {
-        $stateChangeEvents[] = ['new' => $newState, 'old' => $oldState];
+    $breaker->onStateChange(function ($event) use (&$stateChangeEvents) {
+        $stateChangeEvents[] = ['new' => $event->getNewState(), 'old' => $event->getPreviousState()];
     });
 
-    $breaker->onOpen(function ($circuitBreaker) use (&$openEvents) {
+    $breaker->onOpen(function ($event) use (&$openEvents) {
         $openEvents[] = true;
     });
 
-    $breaker->onClose(function ($circuitBreaker) use (&$closeEvents) {
+    $breaker->onClose(function ($event) use (&$closeEvents) {
         $closeEvents[] = true;
     });
 
-    $breaker->onHalfOpen(function ($circuitBreaker) use (&$halfOpenEvents) {
+    $breaker->onHalfOpen(function ($event) use (&$halfOpenEvents) {
         $halfOpenEvents[] = true;
     });
 
@@ -67,15 +68,16 @@ test('circuit breaker dispatches state change events', function () {
 });
 
 test('circuit breaker initializes state from storage', function () {
-    // Create a shared storage instance
-    $storage = new InMemoryStorage;
+    // Create a shared repository instance
+    $adapter = new InMemoryStorageAdapter;
+    $repository = new DefaultCircuitStateRepository($adapter, new JsonStorageSerializer);
 
     // Create a circuit breaker with custom options
     $breaker = new CircuitBreaker('test-service', [
         'failure_threshold' => 3,
+        'timeout' => 5,
         'success_threshold' => 2,
-        'timeout' => 30,
-    ], $storage);
+    ], $repository);
 
     // Force the circuit to open
     $breaker->open();
@@ -84,33 +86,42 @@ test('circuit breaker initializes state from storage', function () {
     $breaker->incrementFailureCount();
     $breaker->incrementFailureCount();
 
-    // Create a new circuit breaker with the same service key and storage
-    $newBreaker = new CircuitBreaker('test-service', [], $storage);
+    // Create a new circuit breaker with the same repository
+    $breaker2 = new CircuitBreaker('test-service', [
+        'failure_threshold' => 3,
+        'timeout' => 5,
+        'success_threshold' => 2,
+    ], $repository);
 
     // Verify the state was loaded correctly
-    expect($newBreaker->getState())->toBe('open');
-    expect($newBreaker->getFailureCount())->toBe(2);
+    expect($breaker2->getState())->toBe('open');
+    expect($breaker2->getFailureCount())->toBe(2);
 });
 
 test('circuit breaker saves state to storage', function () {
-    // Create a shared storage instance
-    $storage = new InMemoryStorage;
-
-    // Create a unique service key for this test
+    // Create a shared repository instance with a unique service key
+    $adapter = new InMemoryStorageAdapter;
+    $repository = new DefaultCircuitStateRepository($adapter, new JsonStorageSerializer);
     $serviceKey = 'test-service-'.uniqid();
 
     // Create a circuit breaker
-    $breaker = new CircuitBreaker($serviceKey, [], $storage);
+    $breaker = new CircuitBreaker($serviceKey, [
+        'failure_threshold' => 2,
+        'timeout' => 5,
+        'success_threshold' => 2,
+    ], $repository);
 
     // Initially in closed state
     expect($breaker->getState())->toBe('closed');
 
-    // Force the circuit to open
+    // Force the circuit to open and increment failure count
     $breaker->open();
+    $breaker->incrementFailureCount();
+    $breaker->incrementFailureCount();
 
-    // Create a new circuit breaker with the same service key and storage
-    $newBreaker = new CircuitBreaker($serviceKey, [], $storage);
-
-    // Verify the state was loaded correctly
-    expect($newBreaker->getState())->toBe('open');
+    // Verify storage content directly
+    $storedState = $repository->find($serviceKey);
+    expect($storedState)->not->toBeNull();
+    expect($storedState->state)->toBe('open');
+    expect($storedState->failureCount)->toBe(2);
 });

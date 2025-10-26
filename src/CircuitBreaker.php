@@ -1,15 +1,33 @@
 <?php
 
+declare(strict_types=1);
+
 namespace Farzai\Breaker;
 
+use Farzai\Breaker\Config\CircuitBreakerConfig;
+use Farzai\Breaker\Contracts\TimeProviderInterface;
+use Farzai\Breaker\Events\CallFailedEvent;
+use Farzai\Breaker\Events\CallSucceededEvent;
+use Farzai\Breaker\Events\CircuitClosedEvent;
+use Farzai\Breaker\Events\CircuitHalfOpenedEvent;
+use Farzai\Breaker\Events\CircuitOpenedEvent;
+use Farzai\Breaker\Events\CircuitStateChangedEvent;
 use Farzai\Breaker\Events\EventDispatcher;
-use Farzai\Breaker\Events\Events;
+use Farzai\Breaker\Events\EventSubscriberInterface;
+use Farzai\Breaker\Events\FallbackExecutedEvent;
+use Farzai\Breaker\Health\HealthReport;
+use Farzai\Breaker\Health\HealthStatus;
 use Farzai\Breaker\States\ClosedState;
 use Farzai\Breaker\States\HalfOpenState;
 use Farzai\Breaker\States\OpenState;
 use Farzai\Breaker\States\StateInterface;
-use Farzai\Breaker\Storage\InMemoryStorage;
-use Farzai\Breaker\Storage\StorageInterface;
+use Farzai\Breaker\Storage\Adapters\InMemoryStorageAdapter;
+use Farzai\Breaker\Storage\CircuitStateRepository;
+use Farzai\Breaker\Storage\DefaultCircuitStateRepository;
+use Farzai\Breaker\Storage\JsonStorageSerializer;
+use Farzai\Breaker\Time\SystemTimeProvider;
+use Psr\Log\LoggerInterface;
+use Psr\Log\NullLogger;
 
 class CircuitBreaker
 {
@@ -29,7 +47,7 @@ class CircuitBreaker
 
     protected int $timeout;
 
-    protected StorageInterface $storage;
+    protected CircuitStateRepository $repository;
 
     /**
      * Event dispatcher for circuit breaker events.
@@ -37,21 +55,53 @@ class CircuitBreaker
     protected EventDispatcher $eventDispatcher;
 
     /**
+     * PSR-3 Logger instance.
+     */
+    protected LoggerInterface $logger;
+
+    /**
+     * Time provider for testable time operations.
+     */
+    protected TimeProviderInterface $timeProvider;
+
+    /**
      * Create a new CircuitBreaker instance.
+     *
+     * @param  string  $serviceKey  Unique identifier for the service
+     * @param  CircuitBreakerConfig|array<string, mixed>  $config  Configuration object or array
+     * @param  CircuitStateRepository|null  $repository  State repository
+     * @param  LoggerInterface|null  $logger  PSR-3 logger
+     * @param  TimeProviderInterface|null  $timeProvider  Time provider for testability
      */
     public function __construct(
         string $serviceKey,
-        array $options = [],
-        ?StorageInterface $storage = null
+        CircuitBreakerConfig|array $config = [],
+        ?CircuitStateRepository $repository = null,
+        ?LoggerInterface $logger = null,
+        ?TimeProviderInterface $timeProvider = null
     ) {
         $this->serviceKey = $serviceKey;
 
-        $this->failureThreshold = $options['failure_threshold'] ?? 5;
-        $this->successThreshold = $options['success_threshold'] ?? 2;
-        $this->timeout = $options['timeout'] ?? 30;
+        // Support both Config object and array
+        if ($config instanceof CircuitBreakerConfig) {
+            $this->failureThreshold = $config->failureThreshold;
+            $this->successThreshold = $config->successThreshold;
+            $this->timeout = $config->timeout;
+        } else {
+            $this->failureThreshold = $config['failure_threshold'] ?? 5;
+            $this->successThreshold = $config['success_threshold'] ?? 2;
+            $this->timeout = $config['timeout'] ?? 30;
+        }
 
-        $this->storage = $storage ?? new InMemoryStorage;
+        // Use provided repository or create default in-memory one
+        $this->repository = $repository ?? new DefaultCircuitStateRepository(
+            new InMemoryStorageAdapter,
+            new JsonStorageSerializer
+        );
+
         $this->eventDispatcher = new EventDispatcher;
+        $this->logger = $logger ?? new NullLogger;
+        $this->timeProvider = $timeProvider ?? new SystemTimeProvider;
 
         $this->initializeState();
     }
@@ -61,16 +111,36 @@ class CircuitBreaker
      */
     public function call(callable $callable): mixed
     {
+        $startTime = microtime(true);
+
         try {
             $result = $this->state->call($this, $callable);
 
-            // Dispatch success event
-            $this->eventDispatcher->dispatch(Events::SUCCESS, [$result, $this]);
+            // Calculate execution time in milliseconds
+            $executionTime = (microtime(true) - $startTime) * 1000;
+
+            // Dispatch success event with new event object
+            $event = new CallSucceededEvent(
+                circuitBreaker: $this,
+                result: $result,
+                executionTime: $executionTime,
+                timestamp: time()
+            );
+            $this->eventDispatcher->dispatch($event);
 
             return $result;
         } catch (\Throwable $exception) {
-            // Dispatch failure event
-            $this->eventDispatcher->dispatch(Events::FAILURE, [$exception, $this]);
+            // Calculate execution time in milliseconds
+            $executionTime = (microtime(true) - $startTime) * 1000;
+
+            // Dispatch failure event with new event object
+            $event = new CallFailedEvent(
+                circuitBreaker: $this,
+                exception: $exception,
+                executionTime: $executionTime,
+                timestamp: time()
+            );
+            $this->eventDispatcher->dispatch($event);
 
             throw $exception;
         }
@@ -88,11 +158,23 @@ class CircuitBreaker
         try {
             return $this->call($callable);
         } catch (\Throwable $exception) {
+            $startTime = microtime(true);
+
             // Pass both the exception and the circuit breaker instance to the fallback
             $fallbackResult = $fallback($exception, $this);
 
-            // Dispatch fallback success event
-            $this->eventDispatcher->dispatch(Events::FALLBACK_SUCCESS, [$fallbackResult, $exception, $this]);
+            // Calculate execution time in milliseconds
+            $executionTime = (microtime(true) - $startTime) * 1000;
+
+            // Dispatch fallback success event with new event object
+            $event = new FallbackExecutedEvent(
+                circuitBreaker: $this,
+                result: $fallbackResult,
+                originalException: $exception,
+                executionTime: $executionTime,
+                timestamp: time()
+            );
+            $this->eventDispatcher->dispatch($event);
 
             return $fallbackResult;
         }
@@ -122,7 +204,7 @@ class CircuitBreaker
     public function open(): void
     {
         $this->setState(new OpenState);
-        $this->lastFailureTime = time();
+        $this->lastFailureTime = $this->timeProvider->getCurrentTime();
         $this->resetSuccessCount();
     }
 
@@ -228,80 +310,190 @@ class CircuitBreaker
     }
 
     /**
+     * Get the time provider.
+     */
+    public function getTimeProvider(): TimeProviderInterface
+    {
+        return $this->timeProvider;
+    }
+
+    /**
+     * Get health status report.
+     */
+    public function getHealth(): HealthReport
+    {
+        $state = $this->getState();
+
+        // Determine health status based on circuit state
+        $status = match ($state) {
+            'closed' => $this->failureCount > ($this->failureThreshold / 2)
+                ? HealthStatus::DEGRADED
+                : HealthStatus::HEALTHY,
+            'half-open' => HealthStatus::DEGRADED,
+            'open' => HealthStatus::UNHEALTHY,
+            default => HealthStatus::HEALTHY,
+        };
+
+        // Generate appropriate message
+        $message = match ($status) {
+            HealthStatus::HEALTHY => 'Circuit is healthy and operating normally',
+            HealthStatus::DEGRADED => $state === 'half-open'
+                ? 'Circuit is testing if service has recovered'
+                : "Circuit has {$this->failureCount} failures (threshold: {$this->failureThreshold})",
+            HealthStatus::UNHEALTHY => 'Circuit is open, failing fast to protect system',
+        };
+
+        return new HealthReport(
+            status: $status,
+            state: $state,
+            failureCount: $this->failureCount,
+            successCount: $this->successCount,
+            failureThreshold: $this->failureThreshold,
+            successThreshold: $this->successThreshold,
+            lastFailureTime: $this->lastFailureTime > 0 ? $this->lastFailureTime : null,
+            message: $message,
+        );
+    }
+
+    /**
      * Add a listener for state changes.
      *
-     * @param  callable  $listener  Function that receives ($newState, $oldState, $circuitBreaker)
+     * @param  callable  $listener  Function that receives (CircuitStateChangedEvent $event)
+     * @param  int  $priority  Listener priority (higher = earlier execution)
      * @return int The listener ID
      */
-    public function onStateChange(callable $listener): int
+    public function onStateChange(callable $listener, int $priority = 0): int
     {
-        return $this->eventDispatcher->addListener(Events::STATE_CHANGE, $listener);
+        return $this->eventDispatcher->addListener(CircuitStateChangedEvent::class, $listener, $priority);
     }
 
     /**
      * Add a listener for when the circuit opens.
      *
-     * @param  callable  $listener  Function that receives ($circuitBreaker)
+     * @param  callable  $listener  Function that receives (CircuitOpenedEvent $event)
+     * @param  int  $priority  Listener priority (higher = earlier execution)
      * @return int The listener ID
      */
-    public function onOpen(callable $listener): int
+    public function onOpen(callable $listener, int $priority = 0): int
     {
-        return $this->eventDispatcher->addListener(Events::OPEN, $listener);
+        return $this->eventDispatcher->addListener(CircuitOpenedEvent::class, $listener, $priority);
     }
 
     /**
      * Add a listener for when the circuit closes.
      *
-     * @param  callable  $listener  Function that receives ($circuitBreaker)
+     * @param  callable  $listener  Function that receives (CircuitClosedEvent $event)
+     * @param  int  $priority  Listener priority (higher = earlier execution)
      * @return int The listener ID
      */
-    public function onClose(callable $listener): int
+    public function onClose(callable $listener, int $priority = 0): int
     {
-        return $this->eventDispatcher->addListener(Events::CLOSE, $listener);
+        return $this->eventDispatcher->addListener(CircuitClosedEvent::class, $listener, $priority);
     }
 
     /**
      * Add a listener for when the circuit transitions to half-open.
      *
-     * @param  callable  $listener  Function that receives ($circuitBreaker)
+     * @param  callable  $listener  Function that receives (CircuitHalfOpenedEvent $event)
+     * @param  int  $priority  Listener priority (higher = earlier execution)
      * @return int The listener ID
      */
-    public function onHalfOpen(callable $listener): int
+    public function onHalfOpen(callable $listener, int $priority = 0): int
     {
-        return $this->eventDispatcher->addListener(Events::HALF_OPEN, $listener);
+        return $this->eventDispatcher->addListener(CircuitHalfOpenedEvent::class, $listener, $priority);
     }
 
     /**
      * Add a listener for successful calls.
      *
-     * @param  callable  $listener  Function that receives ($result, $circuitBreaker)
+     * @param  callable  $listener  Function that receives (CallSucceededEvent $event)
+     * @param  int  $priority  Listener priority (higher = earlier execution)
      * @return int The listener ID
      */
-    public function onSuccess(callable $listener): int
+    public function onSuccess(callable $listener, int $priority = 0): int
     {
-        return $this->eventDispatcher->addListener(Events::SUCCESS, $listener);
+        return $this->eventDispatcher->addListener(CallSucceededEvent::class, $listener, $priority);
     }
 
     /**
      * Add a listener for failed calls.
      *
-     * @param  callable  $listener  Function that receives ($exception, $circuitBreaker)
+     * @param  callable  $listener  Function that receives (CallFailedEvent $event)
+     * @param  int  $priority  Listener priority (higher = earlier execution)
      * @return int The listener ID
      */
-    public function onFailure(callable $listener): int
+    public function onFailure(callable $listener, int $priority = 0): int
     {
-        return $this->eventDispatcher->addListener(Events::FAILURE, $listener);
+        return $this->eventDispatcher->addListener(CallFailedEvent::class, $listener, $priority);
     }
 
     /**
      * Add a listener for successful fallbacks.
      *
-     * @param  callable  $listener  Function that receives ($fallbackResult, $exception, $circuitBreaker)
+     * @param  callable  $listener  Function that receives (FallbackExecutedEvent $event)
+     * @param  int  $priority  Listener priority (higher = earlier execution)
      * @return int The listener ID
      */
-    public function onFallbackSuccess(callable $listener): int
+    public function onFallbackSuccess(callable $listener, int $priority = 0): int
     {
-        return $this->eventDispatcher->addListener(Events::FALLBACK_SUCCESS, $listener);
+        return $this->eventDispatcher->addListener(FallbackExecutedEvent::class, $listener, $priority);
+    }
+
+    /**
+     * Add an event subscriber.
+     *
+     * Event subscribers can listen to multiple events in a single class.
+     *
+     * @param  EventSubscriberInterface  $subscriber  The event subscriber
+     * @return array<int> Array of listener IDs
+     */
+    public function addSubscriber(EventSubscriberInterface $subscriber): array
+    {
+        $listenerIds = [];
+        $events = $subscriber::getSubscribedEvents();
+
+        foreach ($events as $eventClass => $params) {
+            // Handle different formats
+            if (is_string($params)) {
+                // Simple format: EventClass::class => 'methodName'
+                $method = $params;
+                $priority = 0;
+            } elseif (is_array($params) && isset($params['method']) && is_string($params['method'])) {
+                // Array format: EventClass::class => ['method' => 'methodName', 'priority' => 10]
+                $method = $params['method'];
+                $priority = is_int($params['priority'] ?? 0) ? $params['priority'] : 0;
+            } elseif (is_array($params) && isset($params[0]) && is_array($params[0])) {
+                // Multiple listeners: EventClass::class => [['method' => 'method1'], ['method' => 'method2']]
+                foreach ($params as $listener) {
+                    if (! is_array($listener) || ! isset($listener['method']) || ! is_string($listener['method'])) {
+                        continue;
+                    }
+                    $method = $listener['method'];
+                    $priority = is_int($listener['priority'] ?? 0) ? $listener['priority'] : 0;
+                    /** @var callable $callable */
+                    $callable = [$subscriber, $method];
+                    $listenerIds[] = $this->eventDispatcher->addListener(
+                        $eventClass,
+                        $callable,
+                        $priority
+                    );
+                }
+
+                continue;
+            } else {
+                continue;
+            }
+
+            /** @var callable $callable */
+            $callable = [$subscriber, $method];
+            $listenerIds[] = $this->eventDispatcher->addListener(
+                $eventClass,
+                $callable,
+                $priority
+            );
+        }
+
+        return $listenerIds;
     }
 
     /**
@@ -320,7 +512,14 @@ class CircuitBreaker
      */
     protected function setState(StateInterface $state): void
     {
-        $oldState = isset($this->state) ? $this->state->getName() : 'none';
+        // Get old state name - will be 'none' on first call (before state is initialized)
+        try {
+            $oldState = $this->state->getName();
+        } catch (\Error) {
+            // State not yet initialized
+            $oldState = 'none';
+        }
+
         $newState = $state->getName();
 
         $this->state = $state;
@@ -331,38 +530,61 @@ class CircuitBreaker
             return;
         }
 
-        // Dispatch general state change event
-        $this->eventDispatcher->dispatch(Events::STATE_CHANGE, [$newState, $oldState, $this]);
+        $timestamp = time();
 
-        // Dispatch specific state transition event
+        // Dispatch general state change event with new event object
+        $stateChangeEvent = new CircuitStateChangedEvent(
+            circuitBreaker: $this,
+            previousState: $oldState,
+            newState: $newState,
+            timestamp: $timestamp
+        );
+        $this->eventDispatcher->dispatch($stateChangeEvent);
+
+        // Dispatch specific state transition event with new event objects
         switch ($newState) {
             case 'open':
-                $this->eventDispatcher->dispatch(Events::OPEN, [$this]);
+                $event = new CircuitOpenedEvent(
+                    circuitBreaker: $this,
+                    failureCount: $this->failureCount,
+                    failureThreshold: $this->failureThreshold,
+                    timeout: $this->timeout,
+                    timestamp: $timestamp
+                );
+                $this->eventDispatcher->dispatch($event);
                 break;
             case 'closed':
-                $this->eventDispatcher->dispatch(Events::CLOSE, [$this]);
+                $event = new CircuitClosedEvent(
+                    circuitBreaker: $this,
+                    previousState: $oldState,
+                    timestamp: $timestamp
+                );
+                $this->eventDispatcher->dispatch($event);
                 break;
             case 'half-open':
-                $this->eventDispatcher->dispatch(Events::HALF_OPEN, [$this]);
+                $event = new CircuitHalfOpenedEvent(
+                    circuitBreaker: $this,
+                    successThreshold: $this->successThreshold,
+                    timestamp: $timestamp
+                );
+                $this->eventDispatcher->dispatch($event);
                 break;
         }
     }
 
     /**
-     * Initialize the circuit state from storage or default to closed.
+     * Initialize the circuit state from repository or default to closed.
      */
     protected function initializeState(): void
     {
-        $data = $this->storage->load($this->serviceKey);
+        $circuitState = $this->repository->find($this->serviceKey);
 
-        if ($data) {
-            $this->failureCount = $data['failure_count'] ?? 0;
-            $this->successCount = $data['success_count'] ?? 0;
-            $this->lastFailureTime = $data['last_failure_time'] ?? 0;
+        if ($circuitState) {
+            $this->failureCount = $circuitState->failureCount;
+            $this->successCount = $circuitState->successCount;
+            $this->lastFailureTime = $circuitState->lastFailureTime ?? 0;
 
-            $stateName = $data['state'] ?? 'closed';
-
-            $this->state = match ($stateName) {
+            $this->state = match ($circuitState->state) {
                 'open' => new OpenState,
                 'half-open' => new HalfOpenState,
                 default => new ClosedState,
@@ -373,15 +595,18 @@ class CircuitBreaker
     }
 
     /**
-     * Save the current state to storage.
+     * Save the current state to repository.
      */
     protected function saveState(): void
     {
-        $this->storage->save($this->serviceKey, [
-            'state' => $this->state->getName(),
-            'failure_count' => $this->failureCount,
-            'success_count' => $this->successCount,
-            'last_failure_time' => $this->lastFailureTime,
-        ]);
+        $circuitState = new \Farzai\Breaker\Storage\CircuitState(
+            serviceKey: $this->serviceKey,
+            state: $this->state->getName(),
+            failureCount: $this->failureCount,
+            successCount: $this->successCount,
+            lastFailureTime: $this->lastFailureTime > 0 ? $this->lastFailureTime : null,
+        );
+
+        $this->repository->save($circuitState);
     }
 }

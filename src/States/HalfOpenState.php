@@ -1,5 +1,7 @@
 <?php
 
+declare(strict_types=1);
+
 namespace Farzai\Breaker\States;
 
 use Farzai\Breaker\CircuitBreaker;

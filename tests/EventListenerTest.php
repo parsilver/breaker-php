@@ -13,33 +13,33 @@ test('event listeners are triggered on state transitions', function () {
     ]);
 
     // Add listeners for all state transitions
-    $breaker->onStateChange(function ($newState, $oldState, $breaker) use (&$events) {
+    $breaker->onStateChange(function ($event) use (&$events) {
         $events[] = [
             'event' => 'state_change',
-            'old_state' => $oldState,
-            'new_state' => $newState,
-            'service' => $breaker->getServiceKey(),
+            'old_state' => $event->getPreviousState(),
+            'new_state' => $event->getNewState(),
+            'service' => $event->getServiceKey(),
         ];
     });
 
-    $breaker->onOpen(function ($breaker) use (&$events) {
+    $breaker->onOpen(function ($event) use (&$events) {
         $events[] = [
             'event' => 'open',
-            'service' => $breaker->getServiceKey(),
+            'service' => $event->getServiceKey(),
         ];
     });
 
-    $breaker->onClose(function ($breaker) use (&$events) {
+    $breaker->onClose(function ($event) use (&$events) {
         $events[] = [
             'event' => 'close',
-            'service' => $breaker->getServiceKey(),
+            'service' => $event->getServiceKey(),
         ];
     });
 
-    $breaker->onHalfOpen(function ($breaker) use (&$events) {
+    $breaker->onHalfOpen(function ($event) use (&$events) {
         $events[] = [
             'event' => 'half_open',
-            'service' => $breaker->getServiceKey(),
+            'service' => $event->getServiceKey(),
         ];
     });
 
@@ -101,19 +101,19 @@ test('event listeners are triggered on success and failure', function () {
     ]);
 
     // Add listeners for success and failure
-    $breaker->onSuccess(function ($result, $breaker) use (&$events) {
+    $breaker->onSuccess(function ($event) use (&$events) {
         $events[] = [
             'event' => 'success',
-            'result' => $result,
-            'service' => $breaker->getServiceKey(),
+            'result' => $event->getResult(),
+            'service' => $event->getServiceKey(),
         ];
     });
 
-    $breaker->onFailure(function ($exception, $breaker) use (&$events) {
+    $breaker->onFailure(function ($event) use (&$events) {
         $events[] = [
             'event' => 'failure',
-            'error' => $exception->getMessage(),
-            'service' => $breaker->getServiceKey(),
+            'error' => $event->getExceptionMessage(),
+            'service' => $event->getServiceKey(),
         ];
     });
 
@@ -152,18 +152,18 @@ test('event listeners work with fallback mechanism', function () {
     ]);
 
     // Add listeners
-    $breaker->onFailure(function ($exception, $breaker) use (&$events) {
+    $breaker->onFailure(function ($event) use (&$events) {
         $events[] = [
             'event' => 'failure',
-            'error' => $exception->getMessage(),
+            'error' => $event->getExceptionMessage(),
         ];
     });
 
-    $breaker->onFallbackSuccess(function ($result, $exception, $breaker) use (&$events) {
+    $breaker->onFallbackSuccess(function ($event) use (&$events) {
         $events[] = [
             'event' => 'fallback_success',
-            'result' => $result,
-            'error' => $exception->getMessage(),
+            'result' => $event->getResult(),
+            'error' => $event->getOriginalExceptionMessage(),
         ];
     });
 
